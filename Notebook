@@ -238,4 +238,153 @@ for i in range(10):
 
 print("\n✅ Monitoring Finished")
 
+##Explaible AI(SHAP):
+
+# ==========================================
+# INSTALL REQUIRED LIBRARY
+# ==========================================
+!pip install shap --quiet
+
+# ==========================================
+# IMPORTS
+# ==========================================
+import shap
+import joblib
+import pandas as pd
+import numpy as np
+import time
+
+# ==========================================
+# LOAD MODEL & SCALER
+# ==========================================
+model = joblib.load('attack_model.pkl')
+scaler = joblib.load('scaler.pkl')
+
+# ==========================================
+# LOAD DATASET
+# ==========================================
+df = pd.read_csv('/content/wustl-ehms-2020_with_attacks_categories.csv')
+
+# ==========================================
+# REMOVE LEAKAGE COLUMNS
+# ==========================================
+leak_cols = [
+    'Attack Category',
+    'SrcAddr', 'DstAddr',
+    'SrcMac', 'DstMac',
+    'sIpId', 'dIpId'
+]
+
+df.drop(columns=leak_cols, inplace=True, errors='ignore')
+
+# ==========================================
+# ENCODE CATEGORICAL COLUMNS
+# ==========================================
+from sklearn.preprocessing import LabelEncoder
+
+le = LabelEncoder()
+
+for col in df.select_dtypes(include='object').columns:
+    df[col] = le.fit_transform(df[col])
+
+# ==========================================
+# FEATURES & LABEL
+# ==========================================
+X = df.drop('Label', axis=1)
+y = df['Label']
+
+# ==========================================
+# SCALE FEATURES
+# ==========================================
+X_scaled = scaler.transform(X)
+
+# ==========================================
+# CREATE SHAP EXPLAINER
+# ==========================================
+# Using XGBoost model inside voting classifier
+explainer = shap.TreeExplainer(model.named_estimators_['xgb'])
+
+# ==========================================
+# DETECTION FUNCTION
+# ==========================================
+def detect_attack_explainable(new_data, actual_label=None):
+
+    # reshape
+    new_data = np.array(new_data).reshape(1, -1)
+
+    # scaling
+    scaled_data = scaler.transform(new_data)
+
+    # prediction
+    prediction = model.predict(scaled_data)[0]
+
+    # probability
+    probability = model.predict_proba(scaled_data)[0][1]
+
+    print("\n======================================")
+
+    if prediction == 1:
+        print("🚨 ATTACK DETECTED")
+    else:
+        print("✅ NORMAL TRAFFIC")
+
+    print(f"Confidence Score: {probability:.4f}")
+
+    if actual_label is not None:
+        print(f"Actual Label: {actual_label}")
+
+    # ======================================
+    # SHAP EXPLANATION
+    # ======================================
+    shap_values = explainer.shap_values(scaled_data)
+
+    # feature importance
+    contributions = pd.DataFrame({
+        'Feature': X.columns,
+        'Impact': shap_values[0]
+    })
+
+    # sort by absolute impact
+    contributions['AbsImpact'] = contributions['Impact'].abs()
+
+    top_features = contributions.sort_values(
+        by='AbsImpact',
+        ascending=False
+    ).head(5)
+
+    print("\n🔍 TOP FEATURES RESPONSIBLE:")
+
+    for _, row in top_features.iterrows():
+
+        direction = "⬆ Increased Attack Chance" \
+            if row['Impact'] > 0 \
+            else "⬇ Reduced Attack Chance"
+
+        print(
+            f"{row['Feature']} "
+            f"(Impact: {row['Impact']:.4f}) "
+            f"{direction}"
+        )
+
+    print("======================================")
+
+# ==========================================
+# REAL-TIME SIMULATION
+# ==========================================
+print("🔴 Explainable IDS Started...\n")
+
+for i in range(10):
+
+    # random real sample
+    idx = np.random.randint(0, len(X))
+
+    sample = X.iloc[idx].values
+    actual = y.iloc[idx]
+
+    detect_attack_explainable(sample, actual)
+
+    time.sleep(2)
+
+print("\n✅ Monitoring Finished")
+
 
