@@ -1,10 +1,10 @@
-
 !pip install xgboost catboost imbalanced-learn --quiet
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import joblib
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -16,242 +16,645 @@ from xgboost import XGBClassifier
 from catboost import CatBoostClassifier
 from sklearn.ensemble import VotingClassifier
 
+import warnings
+warnings.filterwarnings('ignore')
 
-df = pd.read_csv('/content/wustl-ehms-2020_with_attacks_categories.csv')
+import pandas as pd
+import numpy as np
+import joblib
+
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    cross_val_score
+)
+
+from sklearn.preprocessing import (
+    LabelEncoder,
+    StandardScaler
+)
+
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score
+)
+
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.pipeline import Pipeline
+
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE
+
+from xgboost import XGBClassifier
+from catboost import CatBoostClassifier
+
+from sklearn.ensemble import VotingClassifier
+
+df = pd.read_csv('/content/wustl-ehms-2020_with_attacks_categories(1).csv')
 
 print(df.shape)
 df.head()
 
 
+##Ensemble Model
 
 leak_cols = [
-    'Attack Category',  # direct leakage
-    'SrcAddr', 'DstAddr',
-    'SrcMac', 'DstMac',
-    'sIpId', 'dIpId'
+
+    # Direct attack info
+    'Attack Category',
+    'AttackType',
+    'attack',
+
+    # IP / MAC
+    'SrcAddr',
+    'DstAddr',
+    'SrcMac',
+    'DstMac',
+
+    # IDs
+    'Flow ID',
+    'FlowId',
+    'session_id',
+    'connection_id',
+
+    # Packet IDs
+    'sIpId',
+    'dIpId',
+
+    # Time
+    'Timestamp',
+    'StartTime',
+    'LastTime',
+
+    # Ports
+    'Sport',
+    'Dport'
 ]
 
-df.drop(columns=leak_cols, inplace=True, errors='ignore')
+df.drop(columns=leak_cols,
+        inplace=True,
+        errors='ignore')
 
+print("\nAfter Leakage Removal:",
+      df.shape)
 
-le = LabelEncoder()
-for col in df.select_dtypes(include='object').columns:
-    df[col] = le.fit_transform(df[col])
+# =========================================================
+# REMOVE DUPLICATES
+# =========================================================
 
+before = len(df)
+
+df.drop_duplicates(inplace=True)
+
+after = len(df)
+
+print("\nDuplicates Removed:",
+      before - after)
+
+# =========================================================
+# HANDLE MISSING VALUES
+# =========================================================
+
+for col in df.columns:
+
+    if col == 'Label':
+        continue
+
+    if df[col].dtype == 'object':
+
+        df[col] = df[col].fillna('Unknown')
+
+    else:
+
+        df[col] = df[col].fillna(
+            df[col].median()
+        )
+
+# =========================================================
+# 2. SPLIT TRAIN / TEST
+# =========================================================
 
 X = df.drop('Label', axis=1)
+
 y = df['Label']
 
+# Encode target
+target_encoder = LabelEncoder()
 
+y = target_encoder.fit_transform(
+    y.astype(str)
+)
 
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y,
+
+    X,
+    y,
+
     test_size=0.2,
-    random_state=42,
-    stratify=y
-)
-from sklearn.preprocessing import LabelEncoder
-import joblib
 
-encoder_dict = {}
+    stratify=y,
 
-# Encode categorical
-for col in df.select_dtypes(include='object').columns:
-    le = LabelEncoder()
-    df[col] = le.fit_transform(df[col])
-    encoder_dict[col] = le   # save encoder
-
-# Features
-X = df.drop('Label', axis=1)
-
-# SAVE THESE (IMPORTANT)
-joblib.dump(encoder_dict, 'encoders.pkl')
-joblib.dump(X.columns.tolist(), 'features.pkl')
-
-print("✅ encoders.pkl & features.pkl saved")
-
-
-smote = SMOTE(random_state=42)
-X_train, y_train = smote.fit_resample(X_train, y_train)
-
-
-scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_test = scaler.transform(X_test)
-
-
-
-xgb = XGBClassifier(
-    n_estimators=150,
-    max_depth=5,
-    learning_rate=0.08,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    eval_metric='logloss',
     random_state=42
 )
 
+print("\nTrain Shape:",
+      X_train.shape)
+
+print("Test Shape:",
+      X_test.shape)
+
+# =========================================================
+# 3. ENCODING
+# FIT ONLY TRAIN
+# =========================================================
+
+encoder_dict = {}
+
+cat_cols = X_train.select_dtypes(
+    include='object'
+).columns
+
+for col in cat_cols:
+
+    le = LabelEncoder()
+
+    # TRAIN FIT
+    X_train[col] = X_train[col].astype(str)
+
+    le.fit(X_train[col])
+
+    X_train[col] = le.transform(
+        X_train[col]
+    )
+
+    # TEST SAFE TRANSFORM
+    X_test[col] = X_test[col].astype(str)
+
+    X_test[col] = X_test[col].map(
+
+        lambda s:
+
+        le.transform([s])[0]
+
+        if s in le.classes_
+
+        else -1
+    )
+
+    encoder_dict[col] = le
+
+print("\nEncoding Complete")
+
+# =========================================================
+# 4. FEATURE ENGINEERING
+# AFTER SPLIT + ENCODING
+# =========================================================
+
+numeric_cols = X_train.select_dtypes(
+    include=np.number
+).columns.tolist()
+
+# ---------- LOG FEATURES ----------
+
+for col in numeric_cols[:10]:
+
+    try:
+
+        if (X_train[col] >= 0).all():
+
+            X_train[f'{col}_log'] = np.log1p(
+                X_train[col]
+            )
+
+            X_test[f'{col}_log'] = np.log1p(
+                X_test[col]
+            )
+
+    except:
+        pass
+
+# ---------- RATIO FEATURES ----------
+
+if len(numeric_cols) >= 2:
+
+    X_train['ratio_1'] = (
+        X_train[numeric_cols[0]] /
+        (X_train[numeric_cols[1]] + 1)
+    )
+
+    X_test['ratio_1'] = (
+        X_test[numeric_cols[0]] /
+        (X_test[numeric_cols[1]] + 1)
+    )
+
+if len(numeric_cols) >= 4:
+
+    X_train['ratio_2'] = (
+        X_train[numeric_cols[2]] /
+        (X_train[numeric_cols[3]] + 1)
+    )
+
+    X_test['ratio_2'] = (
+        X_test[numeric_cols[2]] /
+        (X_test[numeric_cols[3]] + 1)
+    )
+
+# ---------- STATISTICAL FEATURES ----------
+
+X_train['row_sum'] = X_train.sum(axis=1)
+X_test['row_sum'] = X_test.sum(axis=1)
+
+X_train['row_mean'] = X_train.mean(axis=1)
+X_test['row_mean'] = X_test.mean(axis=1)
+
+X_train['row_std'] = X_train.std(axis=1)
+X_test['row_std'] = X_test.std(axis=1)
+
+print("\nFeature Engineering Complete")
+
+print("Train Shape:",
+      X_train.shape)
+
+# =========================================================
+# 5. HIGH CARDINALITY REMOVAL
+# ONLY CHECK TRAIN
+# =========================================================
+
+high_card_cols = []
+
+for col in X_train.columns:
+
+    unique_ratio = (
+        X_train[col].nunique()
+        /
+        len(X_train)
+    )
+
+    if unique_ratio > 0.95:
+
+        high_card_cols.append(col)
+
+# REMOVE SAME COLS FROM BOTH
+
+X_train.drop(columns=high_card_cols,
+             inplace=True,
+             errors='ignore')
+
+X_test.drop(columns=high_card_cols,
+            inplace=True,
+            errors='ignore')
+
+print("\nHigh Cardinality Removed:")
+
+print(high_card_cols)
+
+# =========================================================
+# REMOVE LOW VARIANCE FEATURES
+# =========================================================
+
+selector = VarianceThreshold(
+    threshold=0
+)
+
+X_train = selector.fit_transform(
+    X_train
+)
+
+X_test = selector.transform(
+    X_test
+)
+
+selected_features = selector.get_feature_names_out()
+
+print("\nSelected Features:",
+      len(selected_features))
+
+# =========================================================
+# 6. CORRELATION CHECK
+# TRAIN ONLY
+# =========================================================
+
+print("\n" + "="*60)
+print("CORRELATION CHECK")
+print("="*60)
+
+temp_df = pd.DataFrame(
+    X_train,
+    columns=selected_features
+)
+
+temp_df['Label'] = y_train
+
+corr = temp_df.corr(
+    numeric_only=True
+)['Label']
+
+high_corr = corr[
+    abs(corr) > 0.95
+]
+
+print("\nHighly Correlated Features:\n")
+
+print(high_corr)
+
+# =========================================================
+# 7. SCALING
+# =========================================================
+
+scaler = StandardScaler()
+
+X_train = scaler.fit_transform(
+    X_train
+)
+
+X_test = scaler.transform(
+    X_test
+)
+
+print("\nScaling Complete")
+
+# =========================================================
+# 8. SMOTE
+# TRAIN ONLY
+# =========================================================
+
+smote = SMOTE(
+    random_state=42
+)
+
+X_train, y_train = smote.fit_resample(
+
+    X_train,
+    y_train
+)
+
+print("\nAfter SMOTE:",
+      X_train.shape)
+
+# =========================================================
+# 9. TRAINING
+# =========================================================
+
+xgb = XGBClassifier(
+
+    n_estimators=300,
+    max_depth=8,
+    learning_rate=0.05,
+
+    subsample=0.8,
+    colsample_bytree=0.8,
+
+    eval_metric='logloss',
+
+    random_state=42,
+    n_jobs=-1
+)
+
 cat = CatBoostClassifier(
-    iterations=150,
-    depth=5,
-    learning_rate=0.08,
+
+    iterations=300,
+    depth=8,
+    learning_rate=0.05,
+
     verbose=0,
+
     random_state=42
 )
 
 model = VotingClassifier(
-    estimators=[('xgb', xgb), ('cat', cat)],
-    voting='soft'
+
+    estimators=[
+
+        ('xgb', xgb),
+        ('cat', cat)
+
+    ],
+
+    voting='soft',
+
+    n_jobs=-1
 )
+
+print("\n" + "="*60)
+print("TRAINING MODEL")
+print("="*60)
 
 model.fit(X_train, y_train)
 
+print("\n✅ Training Complete")
 
+# =========================================================
+# PREDICTION
+# =========================================================
 
 y_pred = model.predict(X_test)
 
-print("Accuracy:", accuracy_score(y_test, y_pred))
+# =========================================================
+# EVALUATION
+# =========================================================
+
+print("\n" + "="*60)
+print("MODEL EVALUATION")
+print("="*60)
+
+accuracy = accuracy_score(
+    y_test,
+    y_pred
+)
+
+print(f"\nAccuracy: {accuracy:.4f}")
+
 print("\nClassification Report:\n")
-print(classification_report(y_test, y_pred))
 
+print(
+    classification_report(
+        y_test,
+        y_pred
+    )
+)
 
+# =========================================================
+# ROC AUC
+# =========================================================
 
+try:
 
-from sklearn.metrics import roc_curve, auc
-import matplotlib.pyplot as plt
+    y_prob = model.predict_proba(
+        X_test
+    )[:, 1]
 
-# Predict probability (IMPORTANT)
-y_probs = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(
+        y_test,
+        y_prob
+    )
 
-# ROC calculation
-fpr, tpr, thresholds = roc_curve(y_test, y_probs)
-roc_auc = auc(fpr, tpr)
+    print(f"\nROC-AUC: {auc:.4f}")
 
-# Plot
-plt.figure()
-plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
-plt.plot([0, 1], [0, 1], linestyle='--')  # random line
+except:
+    print("\nROC-AUC skipped")
 
-plt.xlabel("False Positive Rate")
-plt.ylabel("True Positive Rate")
-plt.title("ROC Curve")
-plt.legend(loc="lower right")
+# =========================================================
+# CONFUSION MATRIX
+# =========================================================
 
-plt.show()
+print("\nConfusion Matrix:\n")
 
+print(
+    confusion_matrix(
+        y_test,
+        y_pred
+    )
+)
 
+# =========================================================
+# CROSS VALIDATION
+# =========================================================
 
+print("\n" + "="*60)
+print("CROSS VALIDATION")
+print("="*60)
 
-cm = confusion_matrix(y_test, y_pred)
+cv = StratifiedKFold(
 
-plt.figure(figsize=(7,6))
-sns.heatmap(cm, annot=True, fmt='d')
-plt.title("Confusion Matrix")
-plt.xlabel("Predicted")
-plt.ylabel("Actual")
-plt.show()
+    n_splits=5,
 
+    shuffle=True,
 
+    random_state=42
+)
 
+cv_scores = cross_val_score(
 
-import joblib
+    estimator=model,
 
-joblib.dump(model, 'attack_model.pkl')
-joblib.dump(scaler, 'scaler.pkl')
+    X=X_train,
 
+    y=y_train,
 
+    cv=cv,
 
+    scoring='accuracy',
 
-import joblib
-import pandas as pd
-import numpy as np
-import time
+    n_jobs=-1
+)
 
-# =========================
-# Load trained model
-# =========================
-model = joblib.load('attack_model.pkl')
-scaler = joblib.load('scaler.pkl')
+print("\nFold Scores:\n")
 
-# =========================
-# Load dataset again
-# =========================
-df = pd.read_csv('/content/wustl-ehms-2020_with_attacks_categories.csv')
+print(cv_scores)
 
-# =========================
-# Remove leakage columns
-# =========================
-leak_cols = [
-    'Attack Category',
-    'SrcAddr', 'DstAddr',
-    'SrcMac', 'DstMac',
-    'sIpId', 'dIpId'
-]
+print(
+    f"\nMean CV Accuracy: "
+    f"{cv_scores.mean():.4f}"
+)
 
-df.drop(columns=leak_cols, inplace=True, errors='ignore')
+# =========================================================
+# RANDOM LABEL LEAKAGE TEST
+# =========================================================
 
-# =========================
-# Encode categorical columns
-# =========================
-from sklearn.preprocessing import LabelEncoder
+print("\n" + "="*60)
+print("LEAKAGE VALIDATION")
+print("="*60)
 
-le = LabelEncoder()
+y_random = pd.Series(y_train).sample(
 
-for col in df.select_dtypes(include='object').columns:
-    df[col] = le.fit_transform(df[col])
+    frac=1,
 
-# =========================
-# Prepare features
-# =========================
-X = df.drop('Label', axis=1)
-y = df['Label']
+    random_state=42
 
-# =========================
-# Real-time detection function
-# =========================
-def detect_attack(new_data, actual_label=None):
+).values
 
-    # reshape
-    new_data = np.array(new_data).reshape(1, -1)
+model.fit(X_train, y_random)
 
-    # scaling
-    new_data = scaler.transform(new_data)
+random_acc = model.score(
+    X_test,
+    y_test
+)
 
-    # prediction
-    prediction = model.predict(new_data)[0]
+print(
+    f"\nRandom Label Accuracy: "
+    f"{random_acc:.4f}"
+)
 
-    # probability
-    probability = model.predict_proba(new_data)[0][1]
+if random_acc > 0.70:
 
-    print("\n==============================")
+    print(
+        "\n⚠️ POSSIBLE LEAKAGE EXISTS"
+    )
 
-    if prediction == 1:
-        print("🚨 ATTACK DETECTED")
-    else:
-        print("✅ NORMAL TRAFFIC")
+else:
 
-    print(f"Prediction Confidence: {probability:.4f}")
+    print(
+        "\n✅ NO MAJOR LEAKAGE DETECTED"
+    )
 
-    if actual_label is not None:
-        print(f"Actual Label: {actual_label}")
+# =========================================================
+# FEATURE IMPORTANCE
+# =========================================================
 
-    print("==============================")
+print("\n" + "="*60)
+print("TOP IMPORTANT FEATURES")
+print("="*60)
 
-# =========================
-# Real-time simulation
-# =========================
-print("🔴 Real-time IDS started...\n")
+# Retrain original
+model.fit(X_train, y_train)
 
-for i in range(10):
+xgb_model = model.named_estimators_['xgb']
 
-    # random real sample from dataset
-    idx = np.random.randint(0, len(X))
+importance_df = pd.DataFrame({
 
-    sample = X.iloc[idx].values
-    actual = y.iloc[idx]
+    'Feature': selected_features,
 
-    detect_attack(sample, actual)
+    'Importance':
+    xgb_model.feature_importances_
+})
 
-    time.sleep(2)
+importance_df = importance_df.sort_values(
 
-print("\n✅ Monitoring Finished")
+    by='Importance',
+
+    ascending=False
+)
+
+print("\nTop 20 Features:\n")
+
+print(
+    importance_df.head(20)
+)
+
+# =========================================================
+# SAVE EVERYTHING
+# =========================================================
+
+joblib.dump(
+    model,
+    'attack_model.pkl'
+)
+
+joblib.dump(
+    scaler,
+    'scaler.pkl'
+)
+
+joblib.dump(
+    encoder_dict,
+    'encoders.pkl'
+)
+
+joblib.dump(
+    target_encoder,
+    'target_encoder.pkl'
+)
+
+joblib.dump(
+    selector,
+    'variance_selector.pkl'
+)
+
+joblib.dump(
+    selected_features.tolist(),
+    'features.pkl'
+)
+
+print("\n✅ ALL FILES SAVED SUCCESSFULLY")
